@@ -77,7 +77,7 @@ void enqueue(queue_t q, void *data) {
     pthread_mutex_unlock(&queue->lock);
 }
 
-// Removes the first element in the queue
+// Removes  the very first element in the queue
 void *dequeue(queue_t q) {
     queue_t_internal *queue = (queue_t_internal *)q;
     pthread_mutex_lock(&queue->lock);
