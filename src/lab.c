@@ -1,129 +1,193 @@
 #include "lab.h"
-#include <pthread.h>
-#include <stdlib.h>
-#include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <assert.h>
 
-// Define the queue structure
-typedef struct queue {
-    void **data;               // Array to hold the data
-    int capacity;              // Maximum capacity of the queue
-    int front;                 // Index of the front element
-    int rear;                  // Index of the rear element
-    int size;                  // Current size of the queue
-    bool shutdown;             // Shutdown flag
-    pthread_mutex_t lock;      // Mutex for thread safety
-    pthread_cond_t not_empty;  // Condition variable for non-empty queue
-    pthread_cond_t not_full;   // Condition variable for non-full queue
-} queue_t_internal;
+// Hidden queue blueprint storing elements, states, and thread sync tools
+struct queue {
+    void **buffer;              // Internal array for temporary storage units
+    int capacity;               // Max containers that can be held
+    int size;                   // Current active container count
+    int front;                  // Head pointer for removal
+    int rear;                   // Tail pointer for insertion
+    bool is_shutdown_flag;      // Signal to halt operations
+    pthread_mutex_t lock;       // Access gatekeeper
+    pthread_cond_t not_full;    // Signal: space has opened
+    pthread_cond_t not_empty;   // Signal: data is available
+};
 
-// Initialize a new queue
+// Boot up a queue instance with fixed capacity
 queue_t queue_init(int capacity) {
-    queue_t_internal *q = (queue_t_internal *)malloc(sizeof(queue_t_internal));
-    if (!q) {
+    assert(capacity > 0);
+
+    queue_t q = (queue_t)malloc(sizeof(struct queue));
+    if (q == NULL) {
+        perror("Error: Allocation failure for queue base");
         return NULL;
     }
-    q->data = (void **)malloc(capacity * sizeof(void *));
-    if (!q->data) {
+
+    q->buffer = (void **)malloc(capacity * sizeof(void *));
+    if (q->buffer == NULL) {
+        perror("Error: Allocation failure for queue storage");
         free(q);
         return NULL;
     }
+
     q->capacity = capacity;
+    q->size = 0;
     q->front = 0;
     q->rear = -1;
-    q->size = 0;
-    q->shutdown = false;
-    pthread_mutex_init(&q->lock, NULL);
-    pthread_cond_init(&q->not_empty, NULL);
-    pthread_cond_init(&q->not_full, NULL);
-    return (queue_t)q;
-}
+    q->is_shutdown_flag = false;
 
-// Frees all memory and related data, signals all waiting threads
-void queue_destroy(queue_t q) {
-    queue_t_internal *queue = (queue_t_internal *)q;
-    pthread_mutex_lock(&queue->lock);
-    queue->shutdown = true;
-    pthread_cond_broadcast(&queue->not_empty);
-    pthread_cond_broadcast(&queue->not_full);
-    pthread_mutex_unlock(&queue->lock);
-
-    free(queue->data);
-    pthread_mutex_destroy(&queue->lock);
-    pthread_cond_destroy(&queue->not_empty);
-    pthread_cond_destroy(&queue->not_full);
-    free(queue);
-}
-
-// Adds an element to the back of the queue
-void enqueue(queue_t q, void *data) {
-    queue_t_internal *queue = (queue_t_internal *)q;
-    pthread_mutex_lock(&queue->lock);
-
-    while (queue->size == queue->capacity && !queue->shutdown) {
-        pthread_cond_wait(&queue->not_full, &queue->lock);
-    }
-
-    if (queue->shutdown) {
-        pthread_mutex_unlock(&queue->lock);
-        return;
-    }
-
-    queue->rear = (queue->rear + 1) % queue->capacity;
-    queue->data[queue->rear] = data;
-    queue->size++;
-
-    pthread_cond_signal(&queue->not_empty);
-    pthread_mutex_unlock(&queue->lock);
-}
-
-// Removes  the very first element in the queue
-void *dequeue(queue_t q) {
-    queue_t_internal *queue = (queue_t_internal *)q;
-    pthread_mutex_lock(&queue->lock);
-
-    while (queue->size == 0 && !queue->shutdown) {
-        pthread_cond_wait(&queue->not_empty, &queue->lock);
-    }
-
-    if (queue->size == 0 && queue->shutdown) {
-        pthread_mutex_unlock(&queue->lock);
+    // Setup internal mutex and coordination signals
+    if (pthread_mutex_init(&q->lock, NULL) != 0) {
+        perror("Error: Mutex setup failed");
+        free(q->buffer);
+        free(q);
         return NULL;
     }
 
-    void *data = queue->data[queue->front];
-    queue->front = (queue->front + 1) % queue->capacity;
-    queue->size--;
+    if (pthread_cond_init(&q->not_full, NULL) != 0) {
+        perror("Error: not_full signal setup failed");
+        pthread_mutex_destroy(&q->lock);
+        free(q->buffer);
+        free(q);
+        return NULL;
+    }
 
-    pthread_cond_signal(&queue->not_full);
-    pthread_mutex_unlock(&queue->lock);
+    if (pthread_cond_init(&q->not_empty, NULL) != 0) {
+        perror("Error: not_empty signal setup failed");
+        pthread_cond_destroy(&q->not_full);
+        pthread_mutex_destroy(&q->lock);
+        free(q->buffer);
+        free(q);
+        return NULL;
+    }
+
+    return q;
+}
+
+// Fully dismantle the queue safely
+void queue_destroy(queue_t q) {
+    if (q == NULL) {
+        return;
+    }
+
+    // Alert any dormant threads before disassembly
+    queue_shutdown(q);
+
+    pthread_mutex_lock(&q->lock);
+    pthread_cond_broadcast(&q->not_full);
+    pthread_cond_broadcast(&q->not_empty);
+    pthread_mutex_unlock(&q->lock);
+
+    pthread_cond_destroy(&q->not_empty);
+    pthread_cond_destroy(&q->not_full);
+    pthread_mutex_destroy(&q->lock);
+
+    free(q->buffer);
+    free(q);
+}
+
+// Inject an item into the tail end
+void enqueue(queue_t q, void *data) {
+    if (q == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&q->lock);
+
+    // Pause until vacancy appears or shutdown initiated
+    while (q->size == q->capacity && !q->is_shutdown_flag) {
+        pthread_cond_wait(&q->not_full, &q->lock);
+    }
+
+    // Abort if operations are halted
+    if (q->is_shutdown_flag) {
+        pthread_mutex_unlock(&q->lock);
+        return;
+    }
+
+    // Insert new item and adjust tracking pointers
+    q->rear = (q->rear + 1) % q->capacity;
+    q->buffer[q->rear] = data;
+    q->size++;
+
+    // Notify others there's now something to fetch
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->lock);
+}
+
+// Extract an item from the head end
+void *dequeue(queue_t q) {
+    if (q == NULL) {
+        return NULL;
+    }
+
+    pthread_mutex_lock(&q->lock);
+
+    // Hold until content arrives or shutdown occurs
+    while (q->size == 0 && !q->is_shutdown_flag) {
+        pthread_cond_wait(&q->not_empty, &q->lock);
+    }
+
+    // Return nothing if nothing is available
+    if (q->size == 0) {
+        pthread_mutex_unlock(&q->lock);
+        return NULL;
+    }
+
+    // Pull the element, cycle the front, reduce count
+    void *data = q->buffer[q->front];
+    q->front = (q->front + 1) % q->capacity;
+    q->size--;
+
+    // Announce space is now present
+    pthread_cond_signal(&q->not_full);
+    pthread_mutex_unlock(&q->lock);
+
     return data;
 }
 
-// Set the shutdown flag in the queue so all threads can complete and exit properly
+// Flip the shutdown switch and alert everyone
 void queue_shutdown(queue_t q) {
-    queue_t_internal *queue = (queue_t_internal *)q;
-    pthread_mutex_lock(&queue->lock);
-    queue->shutdown = true;
-    pthread_cond_broadcast(&queue->not_empty);
-    pthread_cond_broadcast(&queue->not_full);
-    pthread_mutex_unlock(&queue->lock);
+    if (q == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&q->lock);
+    q->is_shutdown_flag = true;
+
+    // Jolt any waiting threads to continue
+    pthread_cond_broadcast(&q->not_empty);
+    pthread_cond_broadcast(&q->not_full);
+    pthread_mutex_unlock(&q->lock);
 }
 
-// Returns true if the queue is empty
+// Determine if the queue is drained
 bool is_empty(queue_t q) {
-    queue_t_internal *queue = (queue_t_internal *)q;
-    pthread_mutex_lock(&queue->lock);
-    bool empty = (queue->size == 0);
-    pthread_mutex_unlock(&queue->lock);
+    if (q == NULL) {
+        return true;
+    }
+
+    pthread_mutex_lock(&q->lock);
+    bool empty = (q->size == 0);
+    pthread_mutex_unlock(&q->lock);
+
     return empty;
 }
 
-// Returns true if the queue is in shutdown state
+// Check whether the queue has been terminated
 bool is_shutdown(queue_t q) {
-    queue_t_internal *queue = (queue_t_internal *)q;
-    pthread_mutex_lock(&queue->lock);
-    bool shutdown = queue->shutdown;
-    pthread_mutex_unlock(&queue->lock);
+    if (q == NULL) {
+        return true;
+    }
+
+    pthread_mutex_lock(&q->lock);
+    bool shutdown = q->is_shutdown_flag;
+    pthread_mutex_unlock(&q->lock);
+
     return shutdown;
 }
+
