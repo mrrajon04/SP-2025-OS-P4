@@ -22,14 +22,14 @@ CFLAGS ?= -Wall -Wextra  -MMD -MP
 DEBUG ?= -g
 SANATIZE ?= -fno-omit-frame-pointer -fsanitize=address
 
-#If you need to link against a library uncomment the line below and add the library name
+
 LDFLAGS ?= -pthread -lreadline
 
-#Default to building without debug flags
+#Default  building without debug flags
 all: $(TARGET_EXEC) $(TARGET_TEST)
 
 #Build with debug flags and address sanitizer
-#https://www.gnu.org/software/make/manual/make.html#Target_002dspecific
+
 debug: CFLAGS += $(SANATIZE)
 debug: CFLAGS += $(DEBUG)
 debug: $(TARGET_EXEC) $(TARGET_TEST)
